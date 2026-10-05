@@ -3,6 +3,7 @@
  * 消费 RoastProfile、GreenBean（以及曲线事件用于节点数统计）；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  * 交互：机型/风门/火力档/常用载量模板维护（useIdbTable 实时订阅）、烘焙记录状态流转
  *       （记录中 → 已完成 / 作废，可恢复）、下豆按载量扣减生豆在库重量、级联删除、余量提醒。
+ * 跨标签页并发：状态流转携带乐观锁版本号，冲突时列出对方当前的状态与载量，确认后才覆盖。
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -43,6 +44,7 @@ import {
   deleteRoastProfile,
   fetchMachineTemplates,
   fetchRoastProfiles,
+  isRoastConflict,
   resetMachineFilters,
   saveMachineTemplate,
   selectMachineFilteredProfiles,
@@ -193,6 +195,32 @@ export default function MachineConfig() {
     });
   };
 
+  /** 状态流转（带乐观锁）：冲突时列出对方当前的状态与载量，确认后才覆盖 */
+  const runAdvanceState = async (profile: RoastProfile, next: RoastState, expectedVersion: number): Promise<void> => {
+    try {
+      await dispatch(advanceRoastState({ id: profile.id, state: next, expectedVersion })).unwrap();
+      message.success(`记录状态已更新为「${ROAST_STATE_LABEL[next]}」`);
+    } catch (error) {
+      if (isRoastConflict(error) && error.kind === 'profile' && error.currentProfile) {
+        const current = error.currentProfile;
+        modal.confirm({
+          title: '该记录已在其他标签页被修改',
+          content: `对方当前：状态「${ROAST_STATE_LABEL[current.state]}」· 载量 ${current.chargeG}g · 火力 ${current.gasLevel} 档；你的操作：把状态改为「${ROAST_STATE_LABEL[next]}」。确认后将基于对方最新版本覆盖状态。`,
+          okText: '仍要修改',
+          cancelText: '放弃并刷新',
+          async onOk() {
+            await runAdvanceState(profile, next, current.version);
+          },
+          async onCancel() {
+            await dispatch(fetchRoastProfiles()).unwrap();
+          },
+        });
+        return;
+      }
+      message.error(`状态流转失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  };
+
   const handleAdvanceState = async (profile: RoastProfile, next: RoastState): Promise<void> => {
     if (next === 'done') {
       const bean = beanMap.get(profile.greenBeanId);
@@ -202,7 +230,7 @@ export default function MachineConfig() {
         content: bean
           ? `将从「${bean.origin} · ${bean.farm}」（在库 ${bean.stockKg}kg）扣减 ${kg}kg${
               bean.stockKg < kg ? '，但当前余量不足，扣减会被拒绝' : ''
-            }。`
+            }。同事务校验状态，两个标签页同时下豆也只会扣减一次。`
           : '未找到关联生豆，将仅更新记录状态。',
         okText: '扣减并完成',
         cancelText: '取消',
@@ -218,12 +246,7 @@ export default function MachineConfig() {
       });
       return;
     }
-    try {
-      await dispatch(advanceRoastState({ id: profile.id, state: next })).unwrap();
-      message.success(`记录状态已更新为「${ROAST_STATE_LABEL[next]}」`);
-    } catch (error) {
-      message.error(`状态流转失败：${error instanceof Error ? error.message : '未知错误'}`);
-    }
+    await runAdvanceState(profile, next, profile.version);
   };
 
   const handleDeleteProfile = (profile: RoastProfile): void => {

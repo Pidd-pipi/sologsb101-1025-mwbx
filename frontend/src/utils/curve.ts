@@ -360,12 +360,3 @@ export function suggestTempC(events: RoastEvent[], type: RoastEventType): number
   };
   return fallback[type];
 }
-
-/**
- * 拖拽排序后重排 atSec：保留原有时间集合，按新顺序逐个映射。
- * 这样时间轴顺序与 atSec 升序始终一致，可直接写回 Dexie。
- */
-export function reassignAtSecByOrder(ordered: RoastEvent[]): RoastEvent[] {
-  const times = ordered.map((event) => event.atSec).sort((a, b) => a - b);
-  return ordered.map((event, index) => ({ ...event, atSec: times[index] }));
-}

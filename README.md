@@ -101,7 +101,8 @@ sologsb101-1025/
         │   ├── ScoreTag.tsx    # 总分 / RoR / 发展率分档标签
         │   ├── FilterBar.tsx   # 关键字 + 多选下拉，同步 URL query
         │   ├── StatBadge.tsx   # 派生值徽标
-        │   └── EmptyPanel.tsx  # 空数据引导 + 新建入口
+        │   ├── EmptyPanel.tsx  # 空数据引导 + 新建入口
+        │   └── ConflictResolver.tsx # 并发冲突逐项裁决弹窗（采用我的 / 保留对方，未决不能入库）
         ├── hooks/
         │   ├── useRoastCurve.ts # 关键节点 / 发展率 / 分段 RoR / 缺节点补录建议
         │   └── useIdbTable.ts   # Dexie 表增删改查 + liveQuery 订阅
@@ -115,7 +116,7 @@ sologsb101-1025/
         ├── router/index.tsx    # 路由表 + ROUTE_META（导航标题）
         └── utils/
             ├── curve.ts        # 温升插值、发展率、分段 RoR、分档与缺节点检测
-            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、扣减、快照导入导出
+            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、乐观锁守卫写入、下豆原子扣减、快照导入导出
             └── export.ts       # 烘焙/杯测/拼配 JSON 导出与结构校验
 ```
 
@@ -137,17 +138,19 @@ sologsb101-1025/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名（Dexie 数据库名）**：`gbroastlog`（`src/utils/db.ts` 里的 `DB_NAME`）。
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1).stores({...})`：初版结构（生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案分表存储）。
-  - `version(2).stores({...}).upgrade(async (tx) => {...})`：**真实迁移逻辑**——为全部表补齐 `createdAt/updatedAt` 并加索引、新增 `machineTemplates` 载量模板表、按 `profileId` 分组后依时间顺序补算历史事件的 `rorPerMin`、按分项权重补算历史杯测的 `totalScore`、兜底处理法/状态/配方明细数组等字段。
+  - `version(2).stores({...}).upgrade(async (tx) => {...})`：为全部表补齐 `createdAt/updatedAt` 并加索引、新增 `machineTemplates` 载量模板表、按 `profileId` 分组后依时间顺序补算历史事件的 `rorPerMin`、按分项权重补算历史杯测的 `totalScore`、兜底处理法/状态/配方明细数组等字段。
+  - `version(3).stores({...}).upgrade(async (tx) => {...})`：为 `roastProfiles` 与 `events` 补齐乐观锁版本号 `version`（历史行一律补 `1`，升级后历史记录仍可正常编辑）。
 - **数据表**：`greenBeans`（生豆）、`roastProfiles`（烘焙记录）、`events`（曲线事件）、`cuppings`（杯测）、`blends`（拼配方案）、`machineTemplates`（载量模板）。
 - **首屏自动播种**：`initDatabase()` 在 `db.greenBeans.count() === 0` 时调用 `seedDatabase()`，灌入三层互相引用的演示数据（4 批生豆 → 4 次烘焙记录 → 15 个曲线节点 / 3 笔杯测 → 3 个拼配方案 + 4 个载量模板），固定 id + `bulkPut`，幂等可重复执行。
 - **业务写入规则**：
   - 删除生豆会级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分；删除烘焙记录同样级联删除事件、杯测并摘除配方成分。
   - 烘焙记录状态流转：记录中 → 已完成 / 作废（已完成可作废，作废可恢复记录中）。
-  - **下豆扣减**：记录中状态的烘焙记录标记「已完成」（或录入下豆节点后确认）时，按 `chargeG` 自动扣减对应生豆的 `stockKg`，余量低于 2kg 给出补货提醒；余量不足会被拒绝，且不会重复扣减。
+  - **跨标签页并发（乐观锁）**：烘焙记录与曲线事件都带 `version`，每次写入 +1。两个标签页同时编辑同一记录/节点时，保存方在事务内比对版本号，不一致即拒绝写入并抛出携带库内当前值的冲突错误；页面弹出 `<ConflictResolver>` 把双方差异（曲线节点、载量、记录状态等）逐项列出，可逐项「采用我的 / 保留对方」，**仍有未决项时确认按钮禁用、不能入库**；全部裁决后按库内最新版本合并重试。拖拽排序写回同样带版本守卫，冲突时整条时间轴二选一。
+  - **下豆扣减**：记录中状态的烘焙记录保存「下豆」节点时，可选择在同一事务里完成「保存节点 + 置为已完成 + 按 `chargeG` 扣减 `stockKg`」（状态、节点、库存要么一起写入成功，要么一起不动）；也可在机型页单独「完成并扣减」。扣减检查与写入在同一个 readwrite 事务中，IndexedDB 会串行化同事务，**同一记录同时下豆只会扣一次库存**；余量不足会被拒绝，余量低于 2kg 给出补货提醒。
   - `/curves` 拖拽排序（HTML5 原生 `draggable`）会保留原有时间集合、按新顺序重排每个节点的 `atSec` 并 `bulkPut` 写回 Dexie。
-- **导入导出**：`/blends` 支持整库档案 JSON 导出/导入（导入前 `parseArchiveJson` 结构校验，导入会清空当前本地库后写入）与单个方案 JSON 导入（`parseBlendJson` 校验占比必须等于 100%）；`/curves`、`/development`、`/cuppings`、`/beans` 也分别提供曲线档案、杯测档案与整库档案的导出。
+- **导入导出**：`/blends` 支持整库档案 JSON 导出/导入（导入前 `parseArchiveJson` 结构校验，导入会清空当前本地库后写入；旧档案缺少 `version` 字段时兜底补 `1`）与单个方案 JSON 导入（`parseBlendJson` 校验占比必须等于 100%）；`/curves`、`/development`、`/cuppings`、`/beans` 也分别提供曲线档案、杯测档案与整库档案的导出。
 - **容器无状态**：没有后端、没有数据库服务、不挂载命名卷；数据只在访问者浏览器里，换浏览器或清除站点数据即恢复到「空库 + 重新播种」状态。
 
 ---

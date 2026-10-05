@@ -1,27 +1,35 @@
 /**
  * 烘焙 slice：维护烘焙记录列表、当前记录的曲线事件与「曲线事件草稿」、
  * 载量模板（机型 / 风门 / 火力档）以及状态流转动作。
+ * 跨标签页并发：所有写动作携带乐观锁版本号，冲突时以 rejectValue 返回
+ * RoastConflict（含库内当前值），由页面弹窗逐项裁决后重试。
  */
 import { createAsyncThunk, createSelector, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import type { Airflow, MachineTemplate, MachineTemplateDraft, RoastProfile, RoastProfileDraft, RoastState } from '../types/roastprofile';
 import { AIRFLOW_ORDER, ROAST_STATE_LABEL, chargeLevelOf } from '../types/roastprofile';
 import type { RoastEvent, RoastEventDraft, RoastEventType } from '../types/event';
 import {
+  EventConflictError,
+  EventOrderConflictError,
+  ProfileConflictError,
   createId,
   listEvents,
   listMachineTemplates,
   listRoastProfiles,
   nowIso,
-  putEvent,
-  putEvents,
   putMachineTemplate,
   putRoastProfile,
   removeEvent,
   removeMachineTemplate,
   removeRoastProfile,
-  updateRoastState,
+  reorderEventsGuarded,
+  saveDropAndConsumeStock,
+  saveEventGuarded,
+  updateRoastProfileGuarded,
+  updateRoastStateGuarded,
+  type StockConsumeResult,
 } from '../utils/db';
-import { reassignAtSecByOrder, sortEventsByTime, type DevBand } from '../utils/curve';
+import { sortEventsByTime, type DevBand } from '../utils/curve';
 import type { RootState } from './store';
 
 export type ChargeLevel = 'sample' | 'standard' | 'full';
@@ -89,47 +97,75 @@ const initialState: RoastStateShape = {
   notice: '',
 };
 
+/* ------------------------------ 并发冲突 ------------------------------ */
+
+/** 写动作冲突时的 rejectValue：携带库内当前值，供页面逐项比对裁决 */
+export interface RoastConflict {
+  kind: 'profile' | 'event' | 'eventOrder';
+  currentProfile?: RoastProfile;
+  currentEvent?: RoastEvent;
+  currentEvents?: RoastEvent[];
+}
+
+/** 判断 thunk 抛出的值是否为版本冲突（配合 unwrap() 的 catch 使用） */
+export function isRoastConflict(value: unknown): value is RoastConflict {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    ['profile', 'event', 'eventOrder'].includes(String((value as RoastConflict).kind))
+  );
+}
+
+type RoastReject = { rejectValue: RoastConflict };
+
 /* ------------------------------ 烘焙记录 ------------------------------ */
 
 export const fetchRoastProfiles = createAsyncThunk('roasts/fetchProfiles', async () => listRoastProfiles());
 
 export const createRoastProfile = createAsyncThunk('roasts/createProfile', async (draft: RoastProfileDraft) => {
   const stamp = nowIso();
-  const row: RoastProfile = { ...draft, id: createId('rp'), createdAt: stamp, updatedAt: stamp };
+  const row: RoastProfile = { ...draft, id: createId('rp'), version: 1, createdAt: stamp, updatedAt: stamp };
   await putRoastProfile(row);
   return listRoastProfiles();
 });
 
-export const updateRoastProfile = createAsyncThunk(
-  'roasts/updateProfile',
-  async (input: { id: string; draft: RoastProfileDraft }) => {
-    const profiles = await listRoastProfiles();
-    const existing = profiles.find((profile) => profile.id === input.id);
-    const stamp = nowIso();
-    const row: RoastProfile = {
-      ...input.draft,
-      id: input.id,
-      createdAt: existing ? existing.createdAt : stamp,
-      updatedAt: stamp,
-    };
-    await putRoastProfile(row);
-    return listRoastProfiles();
-  },
-);
+export const updateRoastProfile = createAsyncThunk<
+  RoastProfile[],
+  { id: string; draft: RoastProfileDraft; expectedVersion: number },
+  RoastReject
+>('roasts/updateProfile', async (input, { rejectWithValue }) => {
+  try {
+    await updateRoastProfileGuarded(input.id, input.draft, input.expectedVersion);
+    return await listRoastProfiles();
+  } catch (error) {
+    if (error instanceof ProfileConflictError) {
+      return rejectWithValue({ kind: 'profile', currentProfile: error.current });
+    }
+    throw error;
+  }
+});
 
 export const deleteRoastProfile = createAsyncThunk('roasts/removeProfile', async (id: string) => {
   await removeRoastProfile(id);
   return listRoastProfiles();
 });
 
-/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复） */
-export const advanceRoastState = createAsyncThunk(
-  'roasts/advanceState',
-  async (input: { id: string; state: RoastState }) => {
-    await updateRoastState(input.id, input.state);
-    return listRoastProfiles();
-  },
-);
+/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复）；带乐观锁 */
+export const advanceRoastState = createAsyncThunk<
+  RoastProfile[],
+  { id: string; state: RoastState; expectedVersion: number },
+  RoastReject
+>('roasts/advanceState', async (input, { rejectWithValue }) => {
+  try {
+    await updateRoastStateGuarded(input.id, input.state, input.expectedVersion);
+    return await listRoastProfiles();
+  } catch (error) {
+    if (error instanceof ProfileConflictError) {
+      return rejectWithValue({ kind: 'profile', currentProfile: error.current });
+    }
+    throw error;
+  }
+});
 
 /* ------------------------------ 曲线事件 ------------------------------ */
 
@@ -141,6 +177,8 @@ export interface EventInput {
   /** 传入则为编辑 */
   id?: string;
   createdAt?: string;
+  /** 编辑已有节点时必传：本次修改基于的版本号（乐观锁） */
+  expectedVersion?: number;
 }
 
 export interface EventSaveResult {
@@ -148,19 +186,19 @@ export interface EventSaveResult {
   saved: RoastEvent;
 }
 
-export const saveEvent = createAsyncThunk<EventSaveResult, EventInput>(
+export const saveEvent = createAsyncThunk<EventSaveResult, EventInput, RoastReject>(
   'roasts/saveEvent',
-  async (input: EventInput) => {
-    const stamp = nowIso();
-    const row: RoastEvent = {
-      ...input.draft,
-      id: input.id ?? createId('ev'),
-      createdAt: input.createdAt ?? stamp,
-      updatedAt: stamp,
-    };
-    await putEvent(row);
-    const events = await listEvents(input.profileId);
-    return { events, saved: row };
+  async (input: EventInput, { rejectWithValue }) => {
+    try {
+      const saved = await saveEventGuarded(input);
+      const events = await listEvents(input.profileId);
+      return { events, saved };
+    } catch (error) {
+      if (error instanceof EventConflictError) {
+        return rejectWithValue({ kind: 'event', currentEvent: error.current });
+      }
+      throw error;
+    }
   },
 );
 
@@ -173,19 +211,71 @@ export const deleteEvent = createAsyncThunk(
 );
 
 /**
- * 提交拖拽排序：按当前草稿顺序重排 atSec 并写回 Dexie。
- * 保留原有时间集合，逐个映射到新顺序，保证时间轴顺序与 atSec 升序一致。
+ * 提交拖拽排序：按当前草稿顺序把库内时间集合重排到各节点并写回 Dexie（带乐观锁）。
+ * force=true 用于冲突裁决后「采用我的排序」：以库内当前行为底，只改 atSec 顺序。
  */
-export const commitEventOrder = createAsyncThunk<RoastEvent[], void, { state: RootState }>(
-  'roasts/commitEventOrder',
-  async (_arg, { getState }) => {
-    const { draftEvents, currentProfileId } = getState().roasts;
-    if (!currentProfileId || draftEvents.length === 0) return [];
-    const remapped = reassignAtSecByOrder(draftEvents).map((event) => ({ ...event, updatedAt: nowIso() }));
-    await putEvents(remapped);
-    return listEvents(currentProfileId);
+export const commitEventOrder = createAsyncThunk<
+  RoastEvent[],
+  { force?: boolean } | undefined,
+  { state: RootState; rejectValue: RoastConflict }
+>('roasts/commitEventOrder', async (arg, { getState, rejectWithValue }) => {
+  const { draftEvents, currentProfileId } = getState().roasts;
+  if (!currentProfileId || draftEvents.length === 0) return [];
+  try {
+    return await reorderEventsGuarded(currentProfileId, draftEvents, Boolean(arg?.force));
+  } catch (error) {
+    if (error instanceof EventOrderConflictError) {
+      return rejectWithValue({ kind: 'eventOrder', currentEvents: error.currentEvents });
+    }
+    throw error;
+  }
+});
+
+/* --------------------------- 下豆原子写入 --------------------------- */
+
+export interface DropConsumePayload {
+  result: StockConsumeResult;
+  events: RoastEvent[];
+  profiles: RoastProfile[];
+}
+
+/**
+ * 下豆原子写入：同一事务内保存下豆节点 + 记录置为已完成 + 按载量扣减库存。
+ * 同一记录在两个标签页同时下豆时，后进入的事务会被拒绝，库存只扣一次。
+ */
+export const saveDropAndConsume = createAsyncThunk<
+  DropConsumePayload,
+  {
+    profileId: string;
+    expectedProfileVersion: number;
+    /** 冲突裁决后合并出的记录字段（可选） */
+    profileDraft?: RoastProfileDraft;
+    eventInput: EventInput;
   },
-);
+  RoastReject
+>('roasts/saveDropAndConsume', async (input, { rejectWithValue }) => {
+  try {
+    const result = await saveDropAndConsumeStock({
+      profileId: input.profileId,
+      expectedProfileVersion: input.expectedProfileVersion,
+      profileDraft: input.profileDraft,
+      eventId: input.eventInput.id,
+      eventCreatedAt: input.eventInput.createdAt,
+      expectedEventVersion: input.eventInput.expectedVersion,
+      eventDraft: input.eventInput.draft,
+    });
+    const [events, profiles] = await Promise.all([listEvents(input.profileId), listRoastProfiles()]);
+    return { result, events, profiles };
+  } catch (error) {
+    if (error instanceof ProfileConflictError) {
+      return rejectWithValue({ kind: 'profile', currentProfile: error.current });
+    }
+    if (error instanceof EventConflictError) {
+      return rejectWithValue({ kind: 'event', currentEvent: error.current });
+    }
+    throw error;
+  }
+});
 
 /* ------------------------------ 载量模板 ------------------------------ */
 
@@ -300,6 +390,8 @@ const roastSlice = createSlice({
         state.profiles = action.payload;
       })
       .addCase(updateRoastProfile.rejected, (state, action) => {
+        // 版本冲突由页面弹窗逐项裁决，不写入通用错误
+        if (action.payload) return;
         state.error = action.error.message ?? '烘焙记录更新失败';
       })
       .addCase(deleteRoastProfile.fulfilled, (state, action) => {
@@ -317,6 +409,7 @@ const roastSlice = createSlice({
         state.profiles = action.payload;
       })
       .addCase(advanceRoastState.rejected, (state, action) => {
+        if (action.payload) return;
         state.error = action.error.message ?? '状态流转失败';
       })
       .addCase(fetchEvents.fulfilled, (state, action) => {
@@ -332,6 +425,7 @@ const roastSlice = createSlice({
         state.notice = '曲线节点已保存';
       })
       .addCase(saveEvent.rejected, (state, action) => {
+        if (action.payload) return;
         state.error = action.error.message ?? '曲线节点保存失败';
       })
       .addCase(deleteEvent.fulfilled, (state, action) => {
@@ -349,7 +443,18 @@ const roastSlice = createSlice({
         }
       })
       .addCase(commitEventOrder.rejected, (state, action) => {
+        if (action.payload) return;
         state.error = action.error.message ?? '曲线排序写回失败';
+      })
+      .addCase(saveDropAndConsume.fulfilled, (state, action) => {
+        state.events = action.payload.events;
+        state.draftEvents = action.payload.events;
+        state.profiles = action.payload.profiles;
+        state.notice = action.payload.result.message;
+      })
+      .addCase(saveDropAndConsume.rejected, (state, action) => {
+        if (action.payload) return;
+        state.error = action.error.message ?? '下豆扣减失败';
       })
       .addCase(fetchMachineTemplates.fulfilled, (state, action) => {
         state.machines = action.payload;

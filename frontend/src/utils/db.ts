@@ -1,27 +1,30 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 2（version(1) 初版 + version(2) 真实迁移）
+ * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 3（version(1) 初版 + version(2)/(3) 真实迁移）
  * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表）
  * - 首屏自动播种演示数据（父→子→孙三层贯通，幂等）
  * - 整库快照导出导入、级联删除、下豆扣减生豆在库重量
+ * - 跨标签页并发：烘焙记录与曲线事件带乐观锁版本号，保存前比对版本，
+ *   冲突时抛出 ConflictError（携带库内当前值），由页面逐项裁决后重试；
+ *   下豆扣减在单个事务内完成「节点 + 状态 + 库存」写入，同一记录只会扣一次库存。
  * 纯前端应用：不依赖任何后端或数据库服务。
  */
 import Dexie, { type Table } from 'dexie';
 import type { GreenBean } from '../types/greenbean';
 import { LOW_STOCK_KG } from '../types/greenbean';
-import type { MachineTemplate, RoastProfile, RoastState } from '../types/roastprofile';
+import type { MachineTemplate, RoastProfile, RoastProfileDraft, RoastState } from '../types/roastprofile';
 import { ROAST_STATE_LABEL } from '../types/roastprofile';
-import type { RoastEvent } from '../types/event';
+import type { RoastEvent, RoastEventDraft } from '../types/event';
 import type { Cupping } from '../types/cupping';
 import { weightedTotalScore } from '../types/cupping';
 import type { Blend } from '../types/blend';
-import { rorPerMinBetween } from './curve';
+import { rorPerMinBetween, sortEventsByTime } from './curve';
 
 /** 数据库名（= 项目英文短名） */
 export const DB_NAME = 'gbroastlog';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 class RoastLogDatabase extends Dexie {
   greenBeans!: Table<GreenBean, string>;
@@ -44,7 +47,7 @@ class RoastLogDatabase extends Dexie {
     });
 
     // v2：补齐 createdAt/updatedAt 索引；新增载量模板表；按时间顺序补算历史 RoR 与杯测总分
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
         roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
@@ -136,6 +139,26 @@ class RoastLogDatabase extends Dexie {
           if (typeof row.targetFlavor !== 'string') row.targetFlavor = '';
         });
       });
+
+    // v3：为烘焙记录与曲线事件补齐乐观锁版本号（跨标签页并发保存检测），历史记录补 version=1 后仍可正常编辑
+    this.version(DB_VERSION)
+      .stores({
+        greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
+        roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
+        events: 'id, profileId, type, atSec, createdAt, updatedAt',
+        cuppings: 'id, profileId, cuppedAt, totalScore, updatedAt',
+        blends: 'id, name, state, createdAt, updatedAt',
+        machineTemplates: 'id, model, chargeG, gasLevel',
+      })
+      .upgrade(async (tx) => {
+        const backfillVersion = (row: Record<string, unknown>): void => {
+          if (typeof row.version !== 'number' || !Number.isFinite(row.version) || row.version < 1) {
+            row.version = 1;
+          }
+        };
+        await tx.table('roastProfiles').toCollection().modify(backfillVersion);
+        await tx.table('events').toCollection().modify(backfillVersion);
+      });
   }
 }
 
@@ -196,6 +219,46 @@ export async function removeGreenBean(id: string): Promise<void> {
   });
 }
 
+/* ------------------------ 并发冲突错误（乐观锁） ------------------------ */
+
+/** 烘焙记录版本冲突：携带库内当前行，供页面逐项比对裁决 */
+export class ProfileConflictError extends Error {
+  readonly current: RoastProfile;
+
+  constructor(current: RoastProfile) {
+    super('该烘焙记录已在其他标签页被修改，保存被拒绝（版本冲突）');
+    this.name = 'ProfileConflictError';
+    this.current = current;
+  }
+}
+
+/** 曲线节点版本冲突：携带库内当前行 */
+export class EventConflictError extends Error {
+  readonly current: RoastEvent;
+
+  constructor(current: RoastEvent) {
+    super('该曲线节点已在其他标签页被修改，保存被拒绝（版本冲突）');
+    this.name = 'EventConflictError';
+    this.current = current;
+  }
+}
+
+/** 时间轴整体排序冲突：携带库内当前完整事件列表 */
+export class EventOrderConflictError extends Error {
+  readonly currentEvents: RoastEvent[];
+
+  constructor(currentEvents: RoastEvent[]) {
+    super('曲线时间轴已在其他标签页被修改，排序写回被拒绝（版本冲突）');
+    this.name = 'EventOrderConflictError';
+    this.currentEvents = currentEvents;
+  }
+}
+
+/** 读取行的版本号（历史数据兜底为 1） */
+function versionOf(row: { version?: number }): number {
+  return typeof row.version === 'number' && Number.isFinite(row.version) && row.version >= 1 ? row.version : 1;
+}
+
 /* ------------------------ 烘焙记录 RoastProfile ------------------------ */
 
 export async function listRoastProfiles(): Promise<RoastProfile[]> {
@@ -209,6 +272,31 @@ export async function getRoastProfile(id: string): Promise<RoastProfile | undefi
 
 export async function putRoastProfile(row: RoastProfile): Promise<void> {
   await db.roastProfiles.put(row);
+}
+
+/**
+ * 带乐观锁的烘焙记录更新：事务内比对 expectedVersion，
+ * 版本不一致说明另一标签页已先写入，抛 ProfileConflictError（不覆盖对方修改）。
+ */
+export async function updateRoastProfileGuarded(
+  id: string,
+  draft: RoastProfileDraft,
+  expectedVersion: number,
+): Promise<RoastProfile> {
+  return db.transaction('rw', db.roastProfiles, async () => {
+    const current = await db.roastProfiles.get(id);
+    if (!current) throw new Error('烘焙记录不存在，可能已被其他标签页删除');
+    if (versionOf(current) !== expectedVersion) throw new ProfileConflictError(current);
+    const row: RoastProfile = {
+      ...draft,
+      id,
+      createdAt: current.createdAt,
+      updatedAt: nowIso(),
+      version: versionOf(current) + 1,
+    };
+    await db.roastProfiles.put(row);
+    return row;
+  });
 }
 
 /** 删除烘焙记录：级联删除曲线事件与杯测，并从拼配配方中摘除相关成分 */
@@ -229,9 +317,20 @@ export async function removeRoastProfile(id: string): Promise<void> {
   });
 }
 
-/** 状态流转：记录中 → 已完成 / 作废 */
-export async function updateRoastState(id: string, state: RoastState): Promise<void> {
-  await db.roastProfiles.update(id, { state, updatedAt: nowIso() });
+/** 状态流转：记录中 → 已完成 / 作废（带乐观锁，版本不一致抛 ProfileConflictError） */
+export async function updateRoastStateGuarded(
+  id: string,
+  state: RoastState,
+  expectedVersion: number,
+): Promise<RoastProfile> {
+  return db.transaction('rw', db.roastProfiles, async () => {
+    const current = await db.roastProfiles.get(id);
+    if (!current) throw new Error('烘焙记录不存在，可能已被其他标签页删除');
+    if (versionOf(current) !== expectedVersion) throw new ProfileConflictError(current);
+    const next: RoastProfile = { ...current, state, updatedAt: nowIso(), version: versionOf(current) + 1 };
+    await db.roastProfiles.put(next);
+    return next;
+  });
 }
 
 /* --------------------------- 曲线事件 RoastEvent --------------------------- */
@@ -257,6 +356,76 @@ export async function putEvents(rows: RoastEvent[]): Promise<void> {
 
 export async function removeEvent(id: string): Promise<void> {
   await db.events.delete(id);
+}
+
+export interface GuardedEventInput {
+  /** 传入则为编辑已有节点 */
+  id?: string;
+  createdAt?: string;
+  /** 编辑时必传：本次修改基于的版本号（乐观锁） */
+  expectedVersion?: number;
+  draft: RoastEventDraft;
+}
+
+/**
+ * 带乐观锁的曲线节点保存：编辑已有节点时事务内比对 expectedVersion，
+ * 版本不一致抛 EventConflictError；新节点 version 从 1 开始。
+ */
+export async function saveEventGuarded(input: GuardedEventInput): Promise<RoastEvent> {
+  return db.transaction('rw', db.events, async () => {
+    const stamp = nowIso();
+    let existing: RoastEvent | undefined;
+    if (input.id) {
+      existing = await db.events.get(input.id);
+      if (!existing) throw new Error('该曲线节点已被其他标签页删除，请刷新后重试');
+      if (input.expectedVersion !== undefined && versionOf(existing) !== input.expectedVersion) {
+        throw new EventConflictError(existing);
+      }
+    }
+    const row: RoastEvent = {
+      ...input.draft,
+      id: input.id ?? createId('ev'),
+      createdAt: input.createdAt ?? existing?.createdAt ?? stamp,
+      updatedAt: stamp,
+      version: existing ? versionOf(existing) + 1 : 1,
+    };
+    await db.events.put(row);
+    return row;
+  });
+}
+
+/**
+ * 拖拽排序写回（带乐观锁）：按草稿顺序把库内当前时间集合重新映射到各节点。
+ * force=false 时先逐个比对草稿版本与库内版本，任一不一致（或节点数变化）即抛
+ * EventOrderConflictError；force=true（用户在冲突裁决中选了「采用我的排序」）
+ * 则以库内当前行为底、只改 atSec 顺序，保留对方已改的豆温 / 备注等字段。
+ */
+export async function reorderEventsGuarded(
+  profileId: string,
+  orderedDrafts: RoastEvent[],
+  force: boolean,
+): Promise<RoastEvent[]> {
+  return db.transaction('rw', db.events, async () => {
+    const current = await db.events.where('profileId').equals(profileId).toArray();
+    const currentById = new Map(current.map((event) => [event.id, event]));
+    if (!force) {
+      const stale =
+        current.length !== orderedDrafts.length ||
+        orderedDrafts.some((draft) => {
+          const row = currentById.get(draft.id);
+          return !row || versionOf(row) !== versionOf(draft);
+        });
+      if (stale) throw new EventOrderConflictError(sortEventsByTime(current));
+    }
+    const times = current.map((event) => event.atSec).sort((a, b) => a - b);
+    const stamp = nowIso();
+    const rows: RoastEvent[] = orderedDrafts.map((draft, index) => {
+      const base = currentById.get(draft.id) ?? draft;
+      return { ...base, atSec: times[index] ?? base.atSec, updatedAt: stamp, version: versionOf(base) + 1 };
+    });
+    await db.events.bulkPut(rows);
+    return sortEventsByTime(rows);
+  });
 }
 
 /* ----------------------------- 杯测 Cupping ----------------------------- */
@@ -321,7 +490,9 @@ export interface StockConsumeResult {
 
 /**
  * 烘焙下豆后按载量自动扣减生豆在库重量，并把记录状态推进为「已完成」。
- * 只有「记录中」的记录允许扣减，避免重复扣减；余量不足时直接拒绝。
+ * 检查与写入在同一个 readwrite 事务里完成；IndexedDB 会串行化同一库上的
+ * readwrite 事务，因此两个标签页同时下豆时，后进入的事务会读到「已完成」
+ * 并被拒绝——同一记录只会扣减一次库存。
  */
 export async function consumeStockForProfile(profileId: string): Promise<StockConsumeResult> {
   return db.transaction('rw', db.greenBeans, db.roastProfiles, async () => {
@@ -359,13 +530,111 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
     const stamp = nowIso();
     const remainingKg = roundKg(bean.stockKg - deductedKg);
     const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
-    const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
+    const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp, version: versionOf(profile) + 1 };
     await db.greenBeans.put(nextBean);
     await db.roastProfiles.put(nextProfile);
     const warning = remainingKg < LOW_STOCK_KG;
     return {
       ok: true,
       message: `已按载量扣减 ${deductedKg}kg，${bean.farm || bean.origin} 余量 ${remainingKg}kg${
+        warning ? '（余量偏低，请及时补货）' : ''
+      }`,
+      deductedKg,
+      remainingKg,
+      warning,
+      bean: nextBean,
+      profile: nextProfile,
+    };
+  });
+}
+
+export interface DropConsumeInput {
+  profileId: string;
+  /** 本次操作基于的烘焙记录版本号（乐观锁） */
+  expectedProfileVersion: number;
+  /** 冲突裁决后合并出的记录字段（不传则只推进状态） */
+  profileDraft?: RoastProfileDraft;
+  /** 下豆节点：传入 id 为编辑已有节点 */
+  eventId?: string;
+  eventCreatedAt?: string;
+  /** 编辑已有节点时必传：基于的节点版本号 */
+  expectedEventVersion?: number;
+  eventDraft: RoastEventDraft;
+}
+
+/**
+ * 下豆原子写入：在单个事务里同时完成「保存下豆节点 + 记录置为已完成 + 按载量扣减库存」，
+ * 任一检查不通过则整体不写入（状态、节点和库存要么一起成功，要么一起不动）。
+ * - 记录不是「记录中」→ 拒绝（另一标签页已完成/作废，库存不会重复扣减）；
+ * - 记录或节点版本号不一致 → 抛 ProfileConflictError / EventConflictError，由页面逐项裁决；
+ * - 生豆余量不足 → 拒绝。
+ */
+export async function saveDropAndConsumeStock(input: DropConsumeInput): Promise<StockConsumeResult> {
+  return db.transaction('rw', db.greenBeans, db.roastProfiles, db.events, async () => {
+    const profile = await db.roastProfiles.get(input.profileId);
+    if (!profile) {
+      return { ok: false, message: '烘焙记录不存在', deductedKg: 0, remainingKg: 0, warning: false };
+    }
+    const bean = await db.greenBeans.get(profile.greenBeanId);
+    if (!bean) {
+      return { ok: false, message: '该烘焙记录关联的生豆已不存在', deductedKg: 0, remainingKg: 0, warning: false };
+    }
+    if (profile.state !== 'recording') {
+      return {
+        ok: false,
+        message: `该记录已在其他标签页置为「${ROAST_STATE_LABEL[profile.state]}」，库存不会重复扣减`,
+        deductedKg: 0,
+        remainingKg: bean.stockKg,
+        warning: bean.stockKg < LOW_STOCK_KG,
+        bean,
+        profile,
+      };
+    }
+    if (versionOf(profile) !== input.expectedProfileVersion) {
+      throw new ProfileConflictError(profile);
+    }
+    let existingEvent: RoastEvent | undefined;
+    if (input.eventId) {
+      existingEvent = await db.events.get(input.eventId);
+      if (!existingEvent) throw new Error('该下豆节点已被其他标签页删除，请刷新后重试');
+      if (input.expectedEventVersion !== undefined && versionOf(existingEvent) !== input.expectedEventVersion) {
+        throw new EventConflictError(existingEvent);
+      }
+    }
+    const chargeG = input.profileDraft?.chargeG ?? profile.chargeG;
+    const deductedKg = roundKg(chargeG / 1000);
+    if (bean.stockKg + 1e-6 < deductedKg) {
+      return {
+        ok: false,
+        message: `生豆余量不足：在库 ${bean.stockKg}kg < 本次载量 ${deductedKg}kg，请先补货或下调载量`,
+        deductedKg: 0,
+        remainingKg: bean.stockKg,
+        warning: true,
+        bean,
+        profile,
+      };
+    }
+    const stamp = nowIso();
+    const eventRow: RoastEvent = {
+      ...input.eventDraft,
+      id: input.eventId ?? createId('ev'),
+      createdAt: input.eventCreatedAt ?? existingEvent?.createdAt ?? stamp,
+      updatedAt: stamp,
+      version: existingEvent ? versionOf(existingEvent) + 1 : 1,
+    };
+    const base: RoastProfile = input.profileDraft
+      ? { ...input.profileDraft, id: profile.id, createdAt: profile.createdAt, version: versionOf(profile), updatedAt: stamp }
+      : profile;
+    const nextProfile: RoastProfile = { ...base, state: 'done', updatedAt: stamp, version: versionOf(profile) + 1 };
+    const remainingKg = roundKg(bean.stockKg - deductedKg);
+    const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
+    await db.events.put(eventRow);
+    await db.roastProfiles.put(nextProfile);
+    await db.greenBeans.put(nextBean);
+    const warning = remainingKg < LOW_STOCK_KG;
+    return {
+      ok: true,
+      message: `下豆节点已保存，已按载量扣减 ${deductedKg}kg，${bean.farm || bean.origin} 余量 ${remainingKg}kg${
         warning ? '（余量偏低，请及时补货）' : ''
       }`,
       deductedKg,
@@ -445,8 +714,11 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.machineTemplates.clear(),
       ]);
       await db.greenBeans.bulkPut(snapshot.greenBeans);
-      await db.roastProfiles.bulkPut(snapshot.roastProfiles);
-      await db.events.bulkPut(snapshot.events);
+      // 旧档案可能没有 version 字段：兜底为 1，导入后历史记录仍可正常编辑
+      await db.roastProfiles.bulkPut(
+        snapshot.roastProfiles.map((row) => ({ ...row, version: versionOf(row) })),
+      );
+      await db.events.bulkPut(snapshot.events.map((row) => ({ ...row, version: versionOf(row) })));
       await db.cuppings.bulkPut(snapshot.cuppings);
       await db.blends.bulkPut(snapshot.blends);
       await db.machineTemplates.bulkPut(snapshot.machineTemplates ?? []);
@@ -578,6 +850,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 4,
       roastedAt: day(2),
       state: 'done',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -591,6 +864,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 5,
       roastedAt: day(6),
       state: 'recording',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -604,6 +878,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 6,
       roastedAt: day(10),
       state: 'done',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -617,6 +892,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 3,
       roastedAt: day(12),
       state: 'void',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -648,6 +924,7 @@ export async function seedDatabase(): Promise<void> {
     beanTempC,
     rorPerMin: 0,
     note,
+    version: 1,
     createdAt: stamp,
     updatedAt: stamp,
   }));

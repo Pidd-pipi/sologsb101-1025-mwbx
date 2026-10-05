@@ -19,6 +19,11 @@ export interface RoastEvent {
   rorPerMin: number;
   /** 备注 */
   note: string;
+  /**
+   * 乐观锁版本号：每次写入 +1。
+   * 跨标签页同时编辑同一节点时，保存前比对版本，不一致即判定冲突，拒绝覆盖对方的修改。
+   */
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -26,7 +31,7 @@ export interface RoastEvent {
 /** 数据模型别名：Event 曲线事件 */
 export type Event = RoastEvent;
 
-export type RoastEventDraft = Omit<RoastEvent, 'id' | 'createdAt' | 'updatedAt'>;
+export type RoastEventDraft = Omit<RoastEvent, 'id' | 'version' | 'createdAt' | 'updatedAt'>;
 
 export const EVENT_TYPE_LABEL: Record<RoastEventType, string> = {
   turning: '回温',
