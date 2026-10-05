@@ -12,6 +12,7 @@ import {
   nowIso,
   putGreenBean,
   removeGreenBean,
+  type DropEventInput,
   type StockConsumeResult,
 } from '../utils/db';
 import type { RootState } from './store';
@@ -80,11 +81,25 @@ export interface ConsumeStockPayload extends StockConsumeResult {
   greenBeans: GreenBean[];
 }
 
-/** 烘焙下豆后按载量自动扣减在库重量（级联刷新生豆列表） */
-export const consumeStock = createAsyncThunk<ConsumeStockPayload, string>(
+export interface ConsumeStockInput {
+  profileId: string;
+  /** 保存前比对的编辑版本号（多标签页并发控制） */
+  baseVersion?: number;
+  /** 下豆节点：与状态、库存在同一事务写入 */
+  dropEvent?: DropEventInput;
+}
+
+/**
+ * 烘焙下豆：下豆节点 + 记录状态 + 库存扣减在同一事务写入（级联刷新生豆列表）。
+ * 同一锅在两个标签页同时下豆时只扣一次库存；版本冲突时不写入并返回对方快照。
+ */
+export const consumeStock = createAsyncThunk<ConsumeStockPayload, ConsumeStockInput>(
   'beans/consumeStock',
-  async (profileId: string) => {
-    const result = await consumeStockForProfile(profileId);
+  async (input) => {
+    const result = await consumeStockForProfile(input.profileId, {
+      baseVersion: input.baseVersion,
+      dropEvent: input.dropEvent,
+    });
     const greenBeans = await listGreenBeans();
     return { ...result, greenBeans };
   },

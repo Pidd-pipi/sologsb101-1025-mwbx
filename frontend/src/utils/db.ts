@@ -1,17 +1,19 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 2（version(1) 初版 + version(2) 真实迁移）
+ * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 3（version(1) 初版 + version(2) 字段迁移 + version(3) 编辑版本号）
  * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表）
  * - 首屏自动播种演示数据（父→子→孙三层贯通，幂等）
  * - 整库快照导出导入、级联删除、下豆扣减生豆在库重量
+ * - 多标签页乐观并发：烘焙记录带 version，保存前比对，冲突时返回对方快照由页面逐项合并；
+ *   下豆（节点 + 状态 + 库存）在同一事务写入，同一锅只会扣一次库存。
  * 纯前端应用：不依赖任何后端或数据库服务。
  */
 import Dexie, { type Table } from 'dexie';
 import type { GreenBean } from '../types/greenbean';
 import { LOW_STOCK_KG } from '../types/greenbean';
-import type { MachineTemplate, RoastProfile, RoastState } from '../types/roastprofile';
+import type { MachineTemplate, RoastProfile, RoastProfileDraft, RoastState } from '../types/roastprofile';
 import { ROAST_STATE_LABEL } from '../types/roastprofile';
-import type { RoastEvent } from '../types/event';
+import type { RoastEvent, RoastEventDraft } from '../types/event';
 import type { Cupping } from '../types/cupping';
 import { weightedTotalScore } from '../types/cupping';
 import type { Blend } from '../types/blend';
@@ -21,7 +23,7 @@ import { rorPerMinBetween } from './curve';
 export const DB_NAME = 'gbroastlog';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 class RoastLogDatabase extends Dexie {
   greenBeans!: Table<GreenBean, string>;
@@ -44,7 +46,7 @@ class RoastLogDatabase extends Dexie {
     });
 
     // v2：补齐 createdAt/updatedAt 索引；新增载量模板表；按时间顺序补算历史 RoR 与杯测总分
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
         roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
@@ -135,6 +137,21 @@ class RoastLogDatabase extends Dexie {
           if (typeof row.state !== 'string') row.state = 'trial';
           if (typeof row.targetFlavor !== 'string') row.targetFlavor = '';
         });
+      });
+
+    // v3：为烘焙记录补齐编辑版本号（多标签页乐观并发控制）。结构不变，仅回填数据，
+    // 历史记录 version 从 1 起，之后照常编辑、照常参与版本比对。
+    this.version(DB_VERSION)
+      .stores({})
+      .upgrade(async (tx) => {
+        await tx
+          .table('roastProfiles')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.version !== 'number' || !Number.isFinite(row.version) || row.version < 1) {
+              row.version = 1;
+            }
+          });
       });
   }
 }
@@ -229,9 +246,24 @@ export async function removeRoastProfile(id: string): Promise<void> {
   });
 }
 
-/** 状态流转：记录中 → 已完成 / 作废 */
-export async function updateRoastState(id: string, state: RoastState): Promise<void> {
-  await db.roastProfiles.update(id, { state, updatedAt: nowIso() });
+/** 状态流转：记录中 → 已完成 / 作废（版本 +1；传入 baseVersion 时先比对版本） */
+export async function updateRoastState(
+  id: string,
+  state: RoastState,
+  baseVersion?: number,
+): Promise<VersionedResult> {
+  return db.transaction('rw', db.roastProfiles, db.events, async () => {
+    const current = await db.roastProfiles.get(id);
+    if (!current) return { ok: false, reason: 'missing', message: '烘焙记录不存在（可能已被其他标签页删除）' };
+    if (baseVersion !== undefined && current.version !== baseVersion) {
+      const remote = await readRoastSnapshot(id);
+      return { ok: false, reason: 'conflict', remote: remote ?? { profile: current, events: [] } };
+    }
+    const next: RoastProfile = { ...current, state, version: current.version + 1, updatedAt: nowIso() };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(id);
+    return { ok: true, profile: next, events: snapshot?.events ?? [] };
+  });
 }
 
 /* --------------------------- 曲线事件 RoastEvent --------------------------- */
@@ -257,6 +289,223 @@ export async function putEvents(rows: RoastEvent[]): Promise<void> {
 
 export async function removeEvent(id: string): Promise<void> {
   await db.events.delete(id);
+}
+
+/* --------------------- 多标签页并发：版本化写入 --------------------- */
+
+/** 对方（数据库）当前快照：版本冲突时交给页面逐项比对合并 */
+export interface RoastRemoteSnapshot {
+  profile: RoastProfile;
+  events: RoastEvent[];
+}
+
+/**
+ * 版本化写入结果：
+ * - ok：写入成功，返回最新记录与曲线节点（version 已 +1）
+ * - conflict：保存前比对版本不一致，附对方快照，调用方必须逐项合并后才能再次入库
+ * - missing / error：记录不存在或业务校验失败，未写入任何内容
+ */
+export type VersionedResult<Extra extends object = object> =
+  | ({ ok: true; profile: RoastProfile; events: RoastEvent[] } & Extra)
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
+
+/** 读取记录 + 曲线节点快照（须在 roastProfiles / events 事务内调用） */
+async function readRoastSnapshot(profileId: string): Promise<RoastRemoteSnapshot | null> {
+  const profile = await db.roastProfiles.get(profileId);
+  if (!profile) return null;
+  const events = await db.events.where('profileId').equals(profileId).toArray();
+  events.sort((a, b) => a.atSec - b.atSec);
+  return { profile, events };
+}
+
+/** 版本比对：不一致时返回对方快照（冲突）；记录不存在返回 null */
+async function conflictIfStale(
+  profileId: string,
+  baseVersion: number,
+): Promise<{ current: RoastProfile } | { conflict: RoastRemoteSnapshot } | null> {
+  const current = await db.roastProfiles.get(profileId);
+  if (!current) return null;
+  if (current.version !== baseVersion) {
+    const remote = await readRoastSnapshot(profileId);
+    return { conflict: remote ?? { profile: current, events: [] } };
+  }
+  return { current };
+}
+
+const MISSING_PROFILE: { ok: false; reason: 'missing'; message: string } = {
+  ok: false,
+  reason: 'missing',
+  message: '烘焙记录不存在（可能已被其他标签页删除）',
+};
+
+/** 保存烘焙记录字段（载量 / 状态 / 机型等）：保存前比对版本，冲突返回对方快照 */
+export async function saveProfileFieldsVersioned(input: {
+  id: string;
+  draft: RoastProfileDraft;
+  baseVersion: number;
+}): Promise<VersionedResult> {
+  return db.transaction('rw', db.roastProfiles, db.events, async () => {
+    const check = await conflictIfStale(input.id, input.baseVersion);
+    if (!check) return MISSING_PROFILE;
+    if ('conflict' in check) return { ok: false, reason: 'conflict', remote: check.conflict };
+    const next: RoastProfile = {
+      ...check.current,
+      ...input.draft,
+      version: check.current.version + 1,
+      updatedAt: nowIso(),
+    };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(input.id);
+    return { ok: true, profile: next, events: snapshot?.events ?? [] };
+  });
+}
+
+/** 保存单个曲线节点（新增 / 编辑）：同事务把记录版本 +1 */
+export async function saveEventVersioned(input: {
+  profileId: string;
+  draft: RoastEventDraft;
+  id: string;
+  createdAt?: string;
+  baseVersion: number;
+}): Promise<VersionedResult<{ saved: RoastEvent }>> {
+  return db.transaction('rw', db.roastProfiles, db.events, async () => {
+    const check = await conflictIfStale(input.profileId, input.baseVersion);
+    if (!check) return MISSING_PROFILE;
+    if ('conflict' in check) return { ok: false, reason: 'conflict', remote: check.conflict };
+    const stamp = nowIso();
+    const row: RoastEvent = {
+      ...input.draft,
+      id: input.id,
+      createdAt: input.createdAt ?? stamp,
+      updatedAt: stamp,
+    };
+    await db.events.put(row);
+    const next: RoastProfile = { ...check.current, version: check.current.version + 1, updatedAt: stamp };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(input.profileId);
+    return { ok: true, profile: next, events: snapshot?.events ?? [], saved: row };
+  });
+}
+
+/** 删除曲线节点：同事务把记录版本 +1 */
+export async function deleteEventVersioned(input: {
+  profileId: string;
+  eventId: string;
+  baseVersion: number;
+}): Promise<VersionedResult> {
+  return db.transaction('rw', db.roastProfiles, db.events, async () => {
+    const check = await conflictIfStale(input.profileId, input.baseVersion);
+    if (!check) return MISSING_PROFILE;
+    if ('conflict' in check) return { ok: false, reason: 'conflict', remote: check.conflict };
+    await db.events.delete(input.eventId);
+    const next: RoastProfile = { ...check.current, version: check.current.version + 1, updatedAt: nowIso() };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(input.profileId);
+    return { ok: true, profile: next, events: snapshot?.events ?? [] };
+  });
+}
+
+/** 拖拽排序写回：整批节点按新顺序落库，同事务把记录版本 +1 */
+export async function commitEventOrderVersioned(input: {
+  profileId: string;
+  events: RoastEvent[];
+  baseVersion: number;
+}): Promise<VersionedResult> {
+  return db.transaction('rw', db.roastProfiles, db.events, async () => {
+    const check = await conflictIfStale(input.profileId, input.baseVersion);
+    if (!check) return MISSING_PROFILE;
+    if ('conflict' in check) return { ok: false, reason: 'conflict', remote: check.conflict };
+    const stamp = nowIso();
+    const existing = await db.events.where('profileId').equals(input.profileId).toArray();
+    const createdById = new Map(existing.map((event) => [event.id, event.createdAt]));
+    const rows = input.events.map((event) => ({
+      ...event,
+      profileId: input.profileId,
+      createdAt: createdById.get(event.id) ?? event.createdAt ?? stamp,
+      updatedAt: stamp,
+    }));
+    if (rows.length > 0) await db.events.bulkPut(rows);
+    const next: RoastProfile = { ...check.current, version: check.current.version + 1, updatedAt: stamp };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(input.profileId);
+    return { ok: true, profile: next, events: snapshot?.events ?? [] };
+  });
+}
+
+/**
+ * 冲突合并入库：以页面逐项合并后的「记录字段 + 完整节点列表」为准落库。
+ * - 再次比对版本（对方可能又保存了），不一致返回最新快照让页面重新合并；
+ * - 远端多出的节点删除、合并列表中的节点写入，与记录字段同一事务提交；
+ * - 合并结果把状态推进为「已完成」时，同事务按载量扣减生豆库存（只扣一次）；
+ *   余量不足则整体不写入。
+ */
+export async function applyRoastMerge(input: {
+  profileId: string;
+  draft: RoastProfileDraft;
+  events: RoastEvent[];
+  baseVersion: number;
+}): Promise<VersionedResult<{ stockMessage: string }>> {
+  return db.transaction('rw', db.roastProfiles, db.events, db.greenBeans, async () => {
+    const check = await conflictIfStale(input.profileId, input.baseVersion);
+    if (!check) return { ...MISSING_PROFILE };
+    if ('conflict' in check) return { ok: false, reason: 'conflict', remote: check.conflict };
+
+    // 先校验库存（只校验不写入），避免事务内部分落库
+    const needDeduct = check.current.state !== 'done' && input.draft.state === 'done';
+    let bean: GreenBean | undefined;
+    let deductedKg = 0;
+    if (needDeduct) {
+      bean = await db.greenBeans.get(input.draft.greenBeanId);
+      if (!bean) {
+        return { ok: false, reason: 'error', message: '合并后状态为「已完成」，但关联生豆不存在，无法扣减库存，未写入任何修改' };
+      }
+      deductedKg = roundKg(input.draft.chargeG / 1000);
+      if (bean.stockKg + 1e-6 < deductedKg) {
+        return {
+          ok: false,
+          reason: 'error',
+          message: `生豆余量不足：在库 ${bean.stockKg}kg < 载量 ${deductedKg}kg，未写入任何修改`,
+        };
+      }
+    }
+
+    const stamp = nowIso();
+    // 1) 曲线节点：以合并列表为准，远端多出的删除
+    const remoteEvents = await db.events.where('profileId').equals(input.profileId).toArray();
+    const createdById = new Map(remoteEvents.map((event) => [event.id, event.createdAt]));
+    const mergedIds = new Set(input.events.map((event) => event.id));
+    const obsoleteIds = remoteEvents.filter((event) => !mergedIds.has(event.id)).map((event) => event.id);
+    if (obsoleteIds.length > 0) await db.events.bulkDelete(obsoleteIds);
+    const rows = input.events.map((event) => ({
+      ...event,
+      profileId: input.profileId,
+      createdAt: createdById.get(event.id) ?? event.createdAt ?? stamp,
+      updatedAt: stamp,
+    }));
+    if (rows.length > 0) await db.events.bulkPut(rows);
+
+    // 2) 库存扣减（与状态、节点同事务）
+    let stockMessage = '';
+    if (needDeduct && bean) {
+      const remainingKg = roundKg(bean.stockKg - deductedKg);
+      await db.greenBeans.put({ ...bean, stockKg: remainingKg, updatedAt: stamp });
+      stockMessage = `已按载量扣减 ${deductedKg}kg，${bean.farm || bean.origin} 余量 ${remainingKg}kg${
+        remainingKg < LOW_STOCK_KG ? '（余量偏低，请及时补货）' : ''
+      }`;
+    }
+
+    // 3) 记录字段与版本
+    const next: RoastProfile = {
+      ...check.current,
+      ...input.draft,
+      version: check.current.version + 1,
+      updatedAt: stamp,
+    };
+    await db.roastProfiles.put(next);
+    const snapshot = await readRoastSnapshot(input.profileId);
+    return { ok: true, profile: next, events: snapshot?.events ?? [], stockMessage };
+  });
 }
 
 /* ----------------------------- 杯测 Cupping ----------------------------- */
@@ -308,6 +557,8 @@ export async function removeMachineTemplate(id: string): Promise<void> {
 
 export interface StockConsumeResult {
   ok: boolean;
+  /** 是否因版本冲突被拒绝（对方标签页已保存新版本，未写入任何内容） */
+  conflict: boolean;
   message: string;
   /** 本次扣减重量（kg） */
   deductedKg: number;
@@ -317,54 +568,97 @@ export interface StockConsumeResult {
   warning: boolean;
   bean?: GreenBean;
   profile?: RoastProfile;
+  /** 写入成功后的曲线节点（含本次下豆节点） */
+  events?: RoastEvent[];
+  /** 版本冲突时对方（数据库）的记录与节点快照，供页面逐项合并 */
+  remote?: RoastRemoteSnapshot;
+}
+
+/** 下豆节点（与状态、库存在同一事务写入） */
+export interface DropEventInput {
+  draft: RoastEventDraft;
+  id: string;
+  createdAt?: string;
 }
 
 /**
- * 烘焙下豆后按载量自动扣减生豆在库重量，并把记录状态推进为「已完成」。
- * 只有「记录中」的记录允许扣减，避免重复扣减；余量不足时直接拒绝。
+ * 烘焙下豆：下豆节点 + 记录状态「已完成」+ 生豆库存扣减，三者在同一事务写入（要么一起成功，要么都不写）。
+ * - 只有「记录中」的记录允许扣减：同一锅在两个标签页同时下豆时，后到的事务看到状态已推进，
+ *   直接拒绝，生豆库存只扣一次；
+ * - 传入 baseVersion 时先比对编辑版本，不一致返回对方快照（conflict），由页面逐项合并后再入库；
+ * - 余量不足直接拒绝，不落任何数据。
  */
-export async function consumeStockForProfile(profileId: string): Promise<StockConsumeResult> {
-  return db.transaction('rw', db.greenBeans, db.roastProfiles, async () => {
+export async function consumeStockForProfile(
+  profileId: string,
+  options: { baseVersion?: number; dropEvent?: DropEventInput } = {},
+): Promise<StockConsumeResult> {
+  return db.transaction('rw', db.greenBeans, db.roastProfiles, db.events, async () => {
+    const reject = (message: string, extra: Partial<StockConsumeResult> = {}): StockConsumeResult => ({
+      ok: false,
+      conflict: false,
+      message,
+      deductedKg: 0,
+      remainingKg: 0,
+      warning: false,
+      ...extra,
+    });
+
     const profile = await db.roastProfiles.get(profileId);
-    if (!profile) {
-      return { ok: false, message: '烘焙记录不存在', deductedKg: 0, remainingKg: 0, warning: false };
-    }
+    if (!profile) return reject('烘焙记录不存在');
     const bean = await db.greenBeans.get(profile.greenBeanId);
-    if (!bean) {
-      return { ok: false, message: '该烘焙记录关联的生豆已不存在', deductedKg: 0, remainingKg: 0, warning: false };
-    }
-    const deductedKg = roundKg(profile.chargeG / 1000);
+    if (!bean) return reject('该烘焙记录关联的生豆已不存在');
     if (profile.state !== 'recording') {
-      return {
-        ok: false,
-        message: `该记录当前为「${ROAST_STATE_LABEL[profile.state]}」，无需重复扣减`,
-        deductedKg: 0,
+      return reject(`该记录当前为「${ROAST_STATE_LABEL[profile.state]}」，无需重复扣减`, {
         remainingKg: bean.stockKg,
         warning: bean.stockKg < LOW_STOCK_KG,
         bean,
         profile,
-      };
+      });
     }
+    if (options.baseVersion !== undefined && profile.version !== options.baseVersion) {
+      const remote = await readRoastSnapshot(profileId);
+      return reject(`该记录刚被其他标签页保存（对方版本 v${profile.version}），请核对差异后再下豆`, {
+        conflict: true,
+        remainingKg: bean.stockKg,
+        warning: bean.stockKg < LOW_STOCK_KG,
+        bean,
+        profile,
+        remote: remote ?? { profile, events: [] },
+      });
+    }
+    const deductedKg = roundKg(profile.chargeG / 1000);
     if (bean.stockKg + 1e-6 < deductedKg) {
-      return {
-        ok: false,
-        message: `生豆余量不足：在库 ${bean.stockKg}kg < 本次载量 ${deductedKg}kg，请先补货或下调载量`,
-        deductedKg: 0,
+      return reject(`生豆余量不足：在库 ${bean.stockKg}kg < 本次载量 ${deductedKg}kg，请先补货或下调载量`, {
         remainingKg: bean.stockKg,
         warning: true,
         bean,
         profile,
-      };
+      });
     }
     const stamp = nowIso();
+    // 1) 下豆节点（同事务）
+    if (options.dropEvent) {
+      const row: RoastEvent = {
+        ...options.dropEvent.draft,
+        id: options.dropEvent.id,
+        createdAt: options.dropEvent.createdAt ?? stamp,
+        updatedAt: stamp,
+      };
+      await db.events.put(row);
+    }
+    // 2) 库存扣减 + 3) 状态推进与版本 +1（同事务，任一失败整体回滚）
     const remainingKg = roundKg(bean.stockKg - deductedKg);
     const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
-    const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
+    const nextProfile: RoastProfile = { ...profile, state: 'done', version: profile.version + 1, updatedAt: stamp };
     await db.greenBeans.put(nextBean);
     await db.roastProfiles.put(nextProfile);
+    const events = (await db.events.where('profileId').equals(profileId).toArray()).sort(
+      (a, b) => a.atSec - b.atSec,
+    );
     const warning = remainingKg < LOW_STOCK_KG;
     return {
       ok: true,
+      conflict: false,
       message: `已按载量扣减 ${deductedKg}kg，${bean.farm || bean.origin} 余量 ${remainingKg}kg${
         warning ? '（余量偏低，请及时补货）' : ''
       }`,
@@ -373,6 +667,7 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
       warning,
       bean: nextBean,
       profile: nextProfile,
+      events,
     };
   });
 }
@@ -445,7 +740,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.machineTemplates.clear(),
       ]);
       await db.greenBeans.bulkPut(snapshot.greenBeans);
-      await db.roastProfiles.bulkPut(snapshot.roastProfiles);
+      // 旧档案可能缺少编辑版本号：导入时兜底为 1，保证历史记录仍可编辑、可参与版本比对
+      await db.roastProfiles.bulkPut(
+        snapshot.roastProfiles.map((profile) => ({
+          ...profile,
+          version:
+            typeof profile.version === 'number' && Number.isFinite(profile.version) && profile.version >= 1
+              ? Math.floor(profile.version)
+              : 1,
+        })),
+      );
       await db.events.bulkPut(snapshot.events);
       await db.cuppings.bulkPut(snapshot.cuppings);
       await db.blends.bulkPut(snapshot.blends);
@@ -578,6 +882,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 4,
       roastedAt: day(2),
       state: 'done',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -591,6 +896,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 5,
       roastedAt: day(6),
       state: 'recording',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -604,6 +910,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 6,
       roastedAt: day(10),
       state: 'done',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -617,6 +924,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 3,
       roastedAt: day(12),
       state: 'void',
+      version: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },

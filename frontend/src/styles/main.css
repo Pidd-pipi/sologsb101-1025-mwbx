@@ -148,3 +148,22 @@ body::before {
   color: rgba(74, 44, 23, 0.6);
   font-size: 12px;
 }
+
+/* 冲突合并弹窗：节点差异行 */
+.gb-conflict-row {
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(122, 82, 48, 0.2);
+}
+
+.gb-conflict-row:last-child {
+  border-bottom: none;
+}
+
+.gb-conflict-compare {
+  margin-top: 6px;
+  padding-left: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}

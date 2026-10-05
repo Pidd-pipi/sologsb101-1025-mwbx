@@ -193,6 +193,17 @@ export default function MachineConfig() {
     });
   };
 
+  /** 版本冲突提示：对方（另一标签页）已保存，展示对方现状并刷新本地数据 */
+  const showConflictWarning = (remote: { profile: RoastProfile; events: RoastEvent[] }): void => {
+    modal.warning({
+      title: '该记录刚被其他标签页保存，本次操作未写入',
+      content: `对方版本 v${remote.profile.version}：状态「${ROAST_STATE_LABEL[remote.profile.state]}」、载量 ${
+        remote.profile.chargeG
+      }g、曲线节点 ${remote.events.length} 个。已为你刷新本地数据，请核对后再操作；如需逐项合并曲线与载量差异，请前往「烘焙曲线」页保存。`,
+      okText: '知道了',
+    });
+  };
+
   const handleAdvanceState = async (profile: RoastProfile, next: RoastState): Promise<void> => {
     if (next === 'done') {
       const bean = beanMap.get(profile.greenBeanId);
@@ -200,17 +211,19 @@ export default function MachineConfig() {
       modal.confirm({
         title: `标记「已完成」并按载量扣减库存？`,
         content: bean
-          ? `将从「${bean.origin} · ${bean.farm}」（在库 ${bean.stockKg}kg）扣减 ${kg}kg${
+          ? `将从「${bean.origin} · ${bean.farm}」（在库 ${bean.stockKg}kg）扣减 ${kg}kg（同一锅同时下豆也只扣一次）${
               bean.stockKg < kg ? '，但当前余量不足，扣减会被拒绝' : ''
             }。`
           : '未找到关联生豆，将仅更新记录状态。',
         okText: '扣减并完成',
         cancelText: '取消',
         async onOk() {
-          const result = await dispatch(consumeStock(profile.id)).unwrap();
+          const result = await dispatch(consumeStock({ profileId: profile.id, baseVersion: profile.version })).unwrap();
           await Promise.all([dispatch(fetchRoastProfiles()).unwrap(), dispatch(fetchMachineTemplates()).unwrap()]);
           if (result.ok) {
             message.success(result.message);
+          } else if (result.conflict && result.remote) {
+            showConflictWarning(result.remote);
           } else {
             message.warning(result.message);
           }
@@ -219,7 +232,18 @@ export default function MachineConfig() {
       return;
     }
     try {
-      await dispatch(advanceRoastState({ id: profile.id, state: next })).unwrap();
+      const result = await dispatch(
+        advanceRoastState({ id: profile.id, state: next, baseVersion: profile.version }),
+      ).unwrap();
+      if (!result.ok) {
+        if (result.reason === 'conflict') {
+          showConflictWarning(result.remote);
+          await dispatch(fetchRoastProfiles()).unwrap();
+        } else {
+          message.error(result.message);
+        }
+        return;
+      }
       message.success(`记录状态已更新为「${ROAST_STATE_LABEL[next]}」`);
     } catch (error) {
       message.error(`状态流转失败：${error instanceof Error ? error.message : '未知错误'}`);

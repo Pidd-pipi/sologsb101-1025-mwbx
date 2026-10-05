@@ -1,25 +1,30 @@
 /**
  * 烘焙 slice：维护烘焙记录列表、当前记录的曲线事件与「曲线事件草稿」、
  * 载量模板（机型 / 风门 / 火力档）以及状态流转动作。
+ * 所有写操作都带编辑版本号（乐观并发）：保存前比对版本，冲突时返回对方快照，
+ * 由页面弹出逐项合并（仍有未决项不能入库）。
  */
 import { createAsyncThunk, createSelector, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import type { Airflow, MachineTemplate, MachineTemplateDraft, RoastProfile, RoastProfileDraft, RoastState } from '../types/roastprofile';
 import { AIRFLOW_ORDER, ROAST_STATE_LABEL, chargeLevelOf } from '../types/roastprofile';
 import type { RoastEvent, RoastEventDraft, RoastEventType } from '../types/event';
 import {
+  applyRoastMerge,
+  commitEventOrderVersioned,
   createId,
+  deleteEventVersioned,
   listEvents,
   listMachineTemplates,
   listRoastProfiles,
   nowIso,
-  putEvent,
-  putEvents,
   putMachineTemplate,
   putRoastProfile,
-  removeEvent,
   removeMachineTemplate,
   removeRoastProfile,
+  saveEventVersioned,
+  saveProfileFieldsVersioned,
   updateRoastState,
+  type RoastRemoteSnapshot,
 } from '../utils/db';
 import { reassignAtSecByOrder, sortEventsByTime, type DevBand } from '../utils/curve';
 import type { RootState } from './store';
@@ -91,29 +96,28 @@ const initialState: RoastStateShape = {
 
 /* ------------------------------ 烘焙记录 ------------------------------ */
 
+/** 版本化写入的统一结果：ok 携带最新列表；conflict 携带对方快照供逐项合并 */
+export type ProfileWritePayload =
+  | { ok: true; profiles: RoastProfile[] }
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
+
 export const fetchRoastProfiles = createAsyncThunk('roasts/fetchProfiles', async () => listRoastProfiles());
 
 export const createRoastProfile = createAsyncThunk('roasts/createProfile', async (draft: RoastProfileDraft) => {
   const stamp = nowIso();
-  const row: RoastProfile = { ...draft, id: createId('rp'), createdAt: stamp, updatedAt: stamp };
+  const row: RoastProfile = { ...draft, id: createId('rp'), version: 1, createdAt: stamp, updatedAt: stamp };
   await putRoastProfile(row);
   return listRoastProfiles();
 });
 
+/** 保存记录字段：保存前比对版本，冲突时返回对方快照（不写入） */
 export const updateRoastProfile = createAsyncThunk(
   'roasts/updateProfile',
-  async (input: { id: string; draft: RoastProfileDraft }) => {
-    const profiles = await listRoastProfiles();
-    const existing = profiles.find((profile) => profile.id === input.id);
-    const stamp = nowIso();
-    const row: RoastProfile = {
-      ...input.draft,
-      id: input.id,
-      createdAt: existing ? existing.createdAt : stamp,
-      updatedAt: stamp,
-    };
-    await putRoastProfile(row);
-    return listRoastProfiles();
+  async (input: { id: string; draft: RoastProfileDraft; baseVersion: number }): Promise<ProfileWritePayload> => {
+    const result = await saveProfileFieldsVersioned(input);
+    if (!result.ok) return result;
+    return { ok: true, profiles: await listRoastProfiles() };
   },
 );
 
@@ -122,12 +126,13 @@ export const deleteRoastProfile = createAsyncThunk('roasts/removeProfile', async
   return listRoastProfiles();
 });
 
-/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复） */
+/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复）；传入 baseVersion 时先比对版本 */
 export const advanceRoastState = createAsyncThunk(
   'roasts/advanceState',
-  async (input: { id: string; state: RoastState }) => {
-    await updateRoastState(input.id, input.state);
-    return listRoastProfiles();
+  async (input: { id: string; state: RoastState; baseVersion?: number }): Promise<ProfileWritePayload> => {
+    const result = await updateRoastState(input.id, input.state, input.baseVersion);
+    if (!result.ok) return result;
+    return { ok: true, profiles: await listRoastProfiles() };
   },
 );
 
@@ -138,52 +143,100 @@ export const fetchEvents = createAsyncThunk('roasts/fetchEvents', async (profile
 export interface EventInput {
   profileId: string;
   draft: RoastEventDraft;
-  /** 传入则为编辑 */
-  id?: string;
+  /** 节点 id（新增时由页面生成，保证冲突合并与落库使用同一个 id） */
+  id: string;
   createdAt?: string;
+  /** 保存前比对的编辑版本号（取打开编辑时记录的 version） */
+  baseVersion: number;
 }
 
-export interface EventSaveResult {
-  events: RoastEvent[];
-  saved: RoastEvent;
-}
+export type EventSavePayload =
+  | { ok: true; events: RoastEvent[]; saved: RoastEvent; profiles: RoastProfile[] }
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
 
-export const saveEvent = createAsyncThunk<EventSaveResult, EventInput>(
+export const saveEvent = createAsyncThunk<EventSavePayload, EventInput>(
   'roasts/saveEvent',
   async (input: EventInput) => {
-    const stamp = nowIso();
-    const row: RoastEvent = {
-      ...input.draft,
-      id: input.id ?? createId('ev'),
-      createdAt: input.createdAt ?? stamp,
-      updatedAt: stamp,
-    };
-    await putEvent(row);
-    const events = await listEvents(input.profileId);
-    return { events, saved: row };
+    const result = await saveEventVersioned(input);
+    if (!result.ok) return result;
+    return { ok: true, events: result.events, saved: result.saved, profiles: await listRoastProfiles() };
   },
 );
 
+export type EventListPayload =
+  | { ok: true; events: RoastEvent[]; profiles: RoastProfile[] }
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
+
 export const deleteEvent = createAsyncThunk(
   'roasts/deleteEvent',
-  async (input: { id: string; profileId: string }) => listEvents(input.profileId).then(async (rows) => {
-    await removeEvent(input.id);
-    return rows.filter((row) => row.id !== input.id);
-  }),
+  async (input: { id: string; profileId: string; baseVersion: number }): Promise<EventListPayload> => {
+    const result = await deleteEventVersioned({ profileId: input.profileId, eventId: input.id, baseVersion: input.baseVersion });
+    if (!result.ok) return result;
+    return { ok: true, events: result.events, profiles: await listRoastProfiles() };
+  },
 );
+
+export type CommitOrderPayload =
+  | { ok: true; events: RoastEvent[]; profiles: RoastProfile[] }
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot; attemptedEvents: RoastEvent[] }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
 
 /**
  * 提交拖拽排序：按当前草稿顺序重排 atSec 并写回 Dexie。
  * 保留原有时间集合，逐个映射到新顺序，保证时间轴顺序与 atSec 升序一致。
+ * 保存前比对版本；冲突时附上我尝试写入的节点顺序（attemptedEvents）供逐项合并。
  */
-export const commitEventOrder = createAsyncThunk<RoastEvent[], void, { state: RootState }>(
+export const commitEventOrder = createAsyncThunk<CommitOrderPayload, void, { state: RootState }>(
   'roasts/commitEventOrder',
   async (_arg, { getState }) => {
-    const { draftEvents, currentProfileId } = getState().roasts;
-    if (!currentProfileId || draftEvents.length === 0) return [];
-    const remapped = reassignAtSecByOrder(draftEvents).map((event) => ({ ...event, updatedAt: nowIso() }));
-    await putEvents(remapped);
-    return listEvents(currentProfileId);
+    const { draftEvents, currentProfileId, profiles } = getState().roasts;
+    const current = profiles.find((profile) => profile.id === currentProfileId);
+    if (!currentProfileId || !current || draftEvents.length === 0) {
+      return { ok: true, events: [], profiles };
+    }
+    const remapped = reassignAtSecByOrder(draftEvents);
+    const result = await commitEventOrderVersioned({
+      profileId: currentProfileId,
+      events: remapped,
+      baseVersion: current.version,
+    });
+    if (!result.ok) {
+      if (result.reason === 'conflict') return { ...result, attemptedEvents: remapped };
+      return result;
+    }
+    return { ok: true, events: result.events, profiles: await listRoastProfiles() };
+  },
+);
+
+/* ------------------------------ 冲突合并入库 ------------------------------ */
+
+export type ResolveConflictPayload =
+  | { ok: true; profiles: RoastProfile[]; events: RoastEvent[]; stockMessage: string }
+  | { ok: false; reason: 'conflict'; remote: RoastRemoteSnapshot }
+  | { ok: false; reason: 'missing' | 'error'; message: string };
+
+/**
+ * 逐项合并后的入库：以合并结果（记录字段 + 完整节点列表）为准，
+ * 再次比对版本后同事务写入；合并结果推进为「已完成」时同事务扣减生豆库存（只扣一次）。
+ */
+export const resolveRoastConflict = createAsyncThunk(
+  'roasts/resolveConflict',
+  async (input: {
+    profileId: string;
+    draft: RoastProfileDraft;
+    events: RoastEvent[];
+    baseVersion: number;
+  }): Promise<ResolveConflictPayload> => {
+    const result = await applyRoastMerge(input);
+    if (!result.ok) return result;
+    return {
+      ok: true,
+      profiles: await listRoastProfiles(),
+      events: result.events,
+      stockMessage: result.stockMessage,
+    };
   },
 );
 
@@ -297,7 +350,7 @@ const roastSlice = createSlice({
         state.error = action.error.message ?? '烘焙记录新建失败';
       })
       .addCase(updateRoastProfile.fulfilled, (state, action) => {
-        state.profiles = action.payload;
+        if (action.payload.ok) state.profiles = action.payload.profiles;
       })
       .addCase(updateRoastProfile.rejected, (state, action) => {
         state.error = action.error.message ?? '烘焙记录更新失败';
@@ -314,7 +367,7 @@ const roastSlice = createSlice({
         state.error = action.error.message ?? '烘焙记录删除失败';
       })
       .addCase(advanceRoastState.fulfilled, (state, action) => {
-        state.profiles = action.payload;
+        if (action.payload.ok) state.profiles = action.payload.profiles;
       })
       .addCase(advanceRoastState.rejected, (state, action) => {
         state.error = action.error.message ?? '状态流转失败';
@@ -327,29 +380,45 @@ const roastSlice = createSlice({
         state.error = action.error.message ?? '曲线事件读取失败';
       })
       .addCase(saveEvent.fulfilled, (state, action) => {
+        if (!action.payload.ok) return;
         state.events = action.payload.events;
         state.draftEvents = action.payload.events;
+        state.profiles = action.payload.profiles;
         state.notice = '曲线节点已保存';
       })
       .addCase(saveEvent.rejected, (state, action) => {
         state.error = action.error.message ?? '曲线节点保存失败';
       })
       .addCase(deleteEvent.fulfilled, (state, action) => {
-        state.events = action.payload;
-        state.draftEvents = action.payload;
+        if (!action.payload.ok) return;
+        state.events = action.payload.events;
+        state.draftEvents = action.payload.events;
+        state.profiles = action.payload.profiles;
       })
       .addCase(deleteEvent.rejected, (state, action) => {
         state.error = action.error.message ?? '曲线节点删除失败';
       })
       .addCase(commitEventOrder.fulfilled, (state, action) => {
-        if (action.payload.length > 0) {
-          state.events = action.payload;
-          state.draftEvents = action.payload;
+        if (!action.payload.ok) return;
+        if (action.payload.events.length > 0) {
+          state.events = action.payload.events;
+          state.draftEvents = action.payload.events;
+          state.profiles = action.payload.profiles;
           state.notice = '曲线顺序与 atSec 已写回本地库';
         }
       })
       .addCase(commitEventOrder.rejected, (state, action) => {
         state.error = action.error.message ?? '曲线排序写回失败';
+      })
+      .addCase(resolveRoastConflict.fulfilled, (state, action) => {
+        if (!action.payload.ok) return;
+        state.profiles = action.payload.profiles;
+        state.events = action.payload.events;
+        state.draftEvents = action.payload.events;
+        state.notice = '冲突已逐项合并入库';
+      })
+      .addCase(resolveRoastConflict.rejected, (state, action) => {
+        state.error = action.error.message ?? '冲突合并入库失败';
       })
       .addCase(fetchMachineTemplates.fulfilled, (state, action) => {
         state.machines = action.payload;

@@ -24,11 +24,16 @@ export interface RoastProfile {
   roastedAt: string;
   /** 状态：记录中 / 已完成 / 作废 */
   state: RoastState;
+  /**
+   * 编辑版本号（乐观并发控制）：从 1 起，记录或其曲线节点每次落库 +1。
+   * 多标签页同时编辑同一锅时，保存前比对版本，不一致即冲突，由页面逐项合并。
+   */
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type RoastProfileDraft = Omit<RoastProfile, 'id' | 'createdAt' | 'updatedAt'>;
+export type RoastProfileDraft = Omit<RoastProfile, 'id' | 'createdAt' | 'updatedAt' | 'version'>;
 
 /** 机型 + 风门 + 火力档 + 常用载量模板（/machines 维护，/curves 建单时复用） */
 export interface MachineTemplate {

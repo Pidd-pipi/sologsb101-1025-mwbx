@@ -3,6 +3,8 @@
  * 消费 Event、RoastProfile、GreenBean；复用 <FilterBar>、<StatBadge>、<EmptyPanel>、<ScoreTag>。
  * 交互：曲线节点增删改、HTML5 原生拖拽排序（写回 atSec）、缺关键节点补录提示、
  *       烘焙记录新建/编辑与状态流转、下豆后按载量扣减生豆库存、曲线档案 JSON 导出。
+ * 并发：所有写操作保存前比对编辑版本号；多标签页冲突时弹出逐项合并（未决项不能入库）；
+ *       下豆节点 + 记录状态 + 生豆库存在同一事务写入，同一锅只扣一次库存。
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -38,9 +40,10 @@ import FilterBar, { type FilterSelectConfig } from '../components/common/FilterB
 import EmptyPanel from '../components/common/EmptyPanel';
 import ScoreTag from '../components/common/ScoreTag';
 import StatBadge from '../components/common/StatBadge';
+import RoastConflictModal from '../components/common/RoastConflictModal';
 import { useRoastCurve } from '../hooks/useRoastCurve';
 import { useAppDispatch, useAppSelector } from '../stores/store';
-import { consumeStock, selectBeanState } from '../stores/beanSlice';
+import { consumeStock, fetchGreenBeans, selectBeanState } from '../stores/beanSlice';
 import {
   commitEventOrder,
   createRoastProfile,
@@ -51,6 +54,7 @@ import {
   fetchRoastProfiles,
   moveDraftEvent,
   resetRoastFilters,
+  resolveRoastConflict,
   saveEvent,
   selectCurrentProfile,
   selectFilteredRoastProfiles,
@@ -86,7 +90,9 @@ import {
   type RoastEventDraft,
   type RoastEventType,
 } from '../types/event';
-import { formatSeconds, suggestRorPerMin, suggestEventTime, suggestTempC } from '../utils/curve';
+import { createId, nowIso, type RoastRemoteSnapshot } from '../utils/db';
+import { toProfileDraft, type MineSnapshot } from '../utils/conflict';
+import { formatSeconds, sortEventsByTime, suggestRorPerMin, suggestEventTime, suggestTempC } from '../utils/curve';
 import { exportRoastCurveJson } from '../utils/export';
 
 interface ProfileFormValues {
@@ -144,6 +150,9 @@ export default function CurveEntry() {
   const dragIndexRef = useRef<number | null>(null);
   const [quickEdit, setQuickEdit] = useState<{ id: string; atSec: number; beanTempC: number } | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
+  /** 保存冲突：我的待保存内容 vs 对方（数据库）快照，逐项合并前不能入库 */
+  const [conflict, setConflict] = useState<{ mine: MineSnapshot; remote: RoastRemoteSnapshot } | null>(null);
+  const [resolving, setResolving] = useState(false);
 
   useEffect(() => {
     void dispatch(fetchRoastProfiles());
@@ -186,6 +195,55 @@ export default function CurveEntry() {
     if (key === 'state') dispatch(setRoastFilters({ states: values as RoastState[] }));
     if (key === 'model') dispatch(setRoastFilters({ machineModels: values }));
     if (key === 'type') dispatch(setRoastFilters({ eventTypes: values as RoastEventType[] }));
+  };
+
+  /* ------------------------------ 并发冲突 ------------------------------ */
+
+  /** 放弃修改或记录被删后，重新同步对方（数据库）最新内容 */
+  const resyncFromRemote = async (): Promise<void> => {
+    await dispatch(fetchRoastProfiles()).unwrap();
+    if (roastState.currentProfileId) {
+      await dispatch(fetchEvents(roastState.currentProfileId)).unwrap();
+    }
+  };
+
+  /** 逐项合并完成 → 以对方版本为基准合并入库（可能同事务扣减库存） */
+  const handleResolveConflict = async (merged: MineSnapshot): Promise<void> => {
+    if (!conflict) return;
+    setResolving(true);
+    try {
+      const result = await dispatch(
+        resolveRoastConflict({
+          profileId: conflict.remote.profile.id,
+          draft: merged.profile,
+          events: merged.events,
+          baseVersion: conflict.remote.profile.version,
+        }),
+      ).unwrap();
+      if (!result.ok) {
+        if (result.reason === 'conflict') {
+          message.warning('对方又保存了新版本，请重新逐项核对差异');
+          setConflict({ mine: merged, remote: result.remote });
+        } else {
+          message.error(result.message);
+        }
+        return;
+      }
+      setConflict(null);
+      message.success(result.stockMessage ? `冲突已合并入库；${result.stockMessage}` : '冲突已逐项合并入库');
+      // 合并可能触发了库存扣减，刷新生豆列表
+      await dispatch(fetchGreenBeans()).unwrap();
+    } catch (error) {
+      message.error(`合并入库失败：${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      setResolving(false);
+    }
+  };
+
+  const handleCancelConflict = async (): Promise<void> => {
+    setConflict(null);
+    message.info('已放弃本次修改，页面数据已同步为对方保存的版本');
+    await resyncFromRemote();
   };
 
   /* ------------------------------ 烘焙记录 ------------------------------ */
@@ -249,7 +307,21 @@ export default function CurveEntry() {
     };
     try {
       if (editingProfileId) {
-        await dispatch(updateRoastProfile({ id: editingProfileId, draft })).unwrap();
+        // 保存前比对版本：对方（另一标签页）已保存时弹出逐项合并
+        const base = roastState.profiles.find((profile) => profile.id === editingProfileId);
+        const result = await dispatch(
+          updateRoastProfile({ id: editingProfileId, draft, baseVersion: base?.version ?? 0 }),
+        ).unwrap();
+        if (!result.ok) {
+          setProfileDrawerOpen(false);
+          if (result.reason === 'conflict') {
+            setConflict({ mine: { profile: draft, events: roastState.events }, remote: result.remote });
+          } else {
+            message.error(result.message);
+            await resyncFromRemote();
+          }
+          return;
+        }
         message.success('烘焙记录已更新');
       } else {
         await dispatch(createRoastProfile(draft)).unwrap();
@@ -309,30 +381,10 @@ export default function CurveEntry() {
     setEventModalOpen(true);
   };
 
-  const afterEventSaved = async (saved: RoastEvent): Promise<void> => {
-    if (saved.type !== 'drop' || !currentProfile || currentProfile.state !== 'recording') return;
-    const bean = beanMap.get(currentProfile.greenBeanId);
-    const kg = Math.round((currentProfile.chargeG / 1000) * 1000) / 1000;
-    modal.confirm({
-      title: '已记录下豆节点，是否按载量扣减生豆库存？',
-      content: bean
-        ? `将从「${bean.origin} · ${bean.farm}」（在库 ${bean.stockKg}kg）扣减 ${kg}kg，并把记录置为「已完成」。`
-        : '未找到关联生豆，仅把记录置为「已完成」。',
-      okText: '扣减并完成',
-      cancelText: '稍后处理',
-      async onOk() {
-        const result = await dispatch(consumeStock(currentProfile.id)).unwrap();
-        if (result.ok) {
-          message.success(result.message);
-        } else {
-          message.warning(result.message);
-        }
-      },
-    });
-  };
-
   const handleEventSubmit = async (values: EventFormValues): Promise<void> => {
     if (!currentProfile) return;
+    // 节点 id 在页面生成：冲突合并与正式落库使用同一个 id
+    const eventId = editingEvent?.id ?? createId('ev');
     const draft: RoastEventDraft = {
       profileId: currentProfile.id,
       type: values.type,
@@ -341,25 +393,104 @@ export default function CurveEntry() {
       rorPerMin: Math.round(values.rorPerMin * 10) / 10,
       note: values.note?.trim() ?? '',
     };
-    try {
-      const result = await dispatch(
-        saveEvent({
-          profileId: currentProfile.id,
-          draft,
-          id: editingEvent?.id,
-          createdAt: editingEvent?.createdAt,
-        }),
-      ).unwrap();
-      message.success(editingEvent ? '曲线节点已更新' : '曲线节点已新增');
-      setEventModalOpen(false);
-      setEditingEvent(null);
-      await afterEventSaved(result.saved);
-    } catch (error) {
-      message.error(`保存失败：${error instanceof Error ? error.message : '未知错误'}`);
+    // 保存前比对用的版本与「我的待保存节点列表」（冲突时逐项合并用）
+    const baseVersion = currentProfile.version;
+    const pendingRow: RoastEvent = {
+      ...draft,
+      id: eventId,
+      createdAt: editingEvent?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    };
+    const mineEvents = sortEventsByTime([...roastState.events.filter((event) => event.id !== eventId), pendingRow]);
+
+    /** 仅保存节点（版本化写入，冲突时不落库） */
+    const persistEventOnly = async (): Promise<void> => {
+      try {
+        const result = await dispatch(
+          saveEvent({
+            profileId: currentProfile.id,
+            draft,
+            id: eventId,
+            createdAt: editingEvent?.createdAt,
+            baseVersion,
+          }),
+        ).unwrap();
+        if (!result.ok) {
+          setEventModalOpen(false);
+          setEditingEvent(null);
+          if (result.reason === 'conflict') {
+            setConflict({ mine: { profile: toProfileDraft(currentProfile), events: mineEvents }, remote: result.remote });
+          } else {
+            message.error(result.message);
+            await resyncFromRemote();
+          }
+          return;
+        }
+        message.success(editingEvent ? '曲线节点已更新' : '曲线节点已新增');
+        setEventModalOpen(false);
+        setEditingEvent(null);
+      } catch (error) {
+        message.error(`保存失败：${error instanceof Error ? error.message : '未知错误'}`);
+      }
+    };
+
+    /** 下豆：节点 + 状态「已完成」+ 生豆库存扣减，同一事务写入（同一锅只扣一次） */
+    const persistDrop = async (): Promise<void> => {
+      try {
+        const result = await dispatch(
+          consumeStock({
+            profileId: currentProfile.id,
+            baseVersion,
+            dropEvent: { draft, id: eventId, createdAt: editingEvent?.createdAt },
+          }),
+        ).unwrap();
+        if (result.ok) {
+          message.success(result.message);
+          setEventModalOpen(false);
+          setEditingEvent(null);
+          await dispatch(fetchRoastProfiles()).unwrap();
+          await dispatch(fetchEvents(currentProfile.id)).unwrap();
+          return;
+        }
+        if (result.conflict && result.remote) {
+          setEventModalOpen(false);
+          setEditingEvent(null);
+          setConflict({
+            mine: { profile: { ...toProfileDraft(currentProfile), state: 'done' }, events: mineEvents },
+            remote: result.remote,
+          });
+          await dispatch(fetchRoastProfiles()).unwrap();
+          return;
+        }
+        message.warning(result.message);
+      } catch (error) {
+        message.error(`下豆失败：${error instanceof Error ? error.message : '未知错误'}`);
+      }
+    };
+
+    const bean = beanMap.get(currentProfile.greenBeanId);
+    // 下豆节点且记录仍在「记录中」：先询问，保证节点 / 状态 / 库存一起写入成功
+    if (draft.type === 'drop' && currentProfile.state === 'recording' && bean) {
+      const kg = Math.round((currentProfile.chargeG / 1000) * 1000) / 1000;
+      modal.confirm({
+        title: '保存下豆节点并完成本锅？',
+        content: `「下豆并扣减」会把下豆节点、记录状态「已完成」与「${bean.origin} · ${bean.farm}」库存 -${kg}kg 在同一事务写入（同一锅同时下豆也只扣一次）；选择「仅保存节点」则只记录节点，稍后再完成。`,
+        okText: '下豆并扣减库存',
+        cancelText: '仅保存节点',
+        async onOk() {
+          await persistDrop();
+        },
+        async onCancel() {
+          await persistEventOnly();
+        },
+      });
+      return;
     }
+    await persistEventOnly();
   };
 
   const handleDeleteEvent = (event: RoastEvent): void => {
+    if (!currentProfile) return;
     modal.confirm({
       title: `删除节点「${EVENT_TYPE_LABEL[event.type]} @ ${formatSeconds(event.atSec)}」？`,
       content: '删除后曲线的发展率与分段 RoR 会立即重算。',
@@ -367,7 +498,24 @@ export default function CurveEntry() {
       okButtonProps: { danger: true },
       cancelText: '取消',
       async onOk() {
-        await dispatch(deleteEvent({ id: event.id, profileId: event.profileId })).unwrap();
+        const result = await dispatch(
+          deleteEvent({ id: event.id, profileId: event.profileId, baseVersion: currentProfile.version }),
+        ).unwrap();
+        if (!result.ok) {
+          if (result.reason === 'conflict') {
+            setConflict({
+              mine: {
+                profile: toProfileDraft(currentProfile),
+                events: roastState.events.filter((item) => item.id !== event.id),
+              },
+              remote: result.remote,
+            });
+          } else {
+            message.error(result.message);
+            await resyncFromRemote();
+          }
+          return;
+        }
         message.success('曲线节点已删除');
       },
     });
@@ -375,9 +523,24 @@ export default function CurveEntry() {
 
   /** 把草稿顺序（atSec 已重排）写回 Dexie */
   const persistOrder = async (): Promise<void> => {
+    if (!currentProfile) return;
     try {
-      await dispatch(commitEventOrder()).unwrap();
-      message.success('时间轴顺序已写回本地库，atSec 已按新顺序重排');
+      const result = await dispatch(commitEventOrder()).unwrap();
+      if (!result.ok) {
+        if (result.reason === 'conflict') {
+          setConflict({
+            mine: { profile: toProfileDraft(currentProfile), events: result.attemptedEvents },
+            remote: result.remote,
+          });
+        } else {
+          message.error(result.message);
+          await resyncFromRemote();
+        }
+        return;
+      }
+      if (result.events.length > 0) {
+        message.success('时间轴顺序已写回本地库，atSec 已按新顺序重排');
+      }
     } catch (error) {
       message.error(`写回失败：${error instanceof Error ? error.message : '未知错误'}`);
     }
@@ -403,21 +566,40 @@ export default function CurveEntry() {
   };
 
   const handleQuickSave = async (event: RoastEvent): Promise<void> => {
-    if (!quickEdit) return;
+    if (!quickEdit || !currentProfile) return;
     const others = curve.events.filter((item) => item.id !== event.id);
+    const draft = toDraft(event, {
+      atSec: Math.round(quickEdit.atSec),
+      beanTempC: Math.round(quickEdit.beanTempC * 10) / 10,
+      rorPerMin: suggestRorPerMin(others, Math.round(quickEdit.atSec), quickEdit.beanTempC),
+    });
     try {
-      await dispatch(
+      const result = await dispatch(
         saveEvent({
           profileId: event.profileId,
           id: event.id,
           createdAt: event.createdAt,
-          draft: toDraft(event, {
-            atSec: Math.round(quickEdit.atSec),
-            beanTempC: Math.round(quickEdit.beanTempC * 10) / 10,
-            rorPerMin: suggestRorPerMin(others, Math.round(quickEdit.atSec), quickEdit.beanTempC),
-          }),
+          baseVersion: currentProfile.version,
+          draft,
         }),
       ).unwrap();
+      if (!result.ok) {
+        setQuickEdit(null);
+        if (result.reason === 'conflict') {
+          const pendingRow: RoastEvent = { ...draft, id: event.id, createdAt: event.createdAt, updatedAt: nowIso() };
+          setConflict({
+            mine: {
+              profile: toProfileDraft(currentProfile),
+              events: sortEventsByTime([...roastState.events.filter((item) => item.id !== event.id), pendingRow]),
+            },
+            remote: result.remote,
+          });
+        } else {
+          message.error(result.message);
+          await resyncFromRemote();
+        }
+        return;
+      }
       message.success('秒点与豆温已更新');
       setQuickEdit(null);
     } catch (error) {
@@ -492,6 +674,9 @@ export default function CurveEntry() {
           {currentProfile ? (
             <>
               <Tag color={ROAST_STATE_COLOR[currentProfile.state]}>{ROAST_STATE_LABEL[currentProfile.state]}</Tag>
+              <Tooltip title="编辑版本号：每次保存 +1，多标签页同时编辑同一锅时用于保存前比对与冲突检测">
+                <Tag>v{currentProfile.version}</Tag>
+              </Tooltip>
               <Tag color={AIRFLOW_COLOR[currentProfile.airflow]}>风门{AIRFLOW_LABEL[currentProfile.airflow]}</Tag>
               <Tag color="#a8632c">火力 {currentProfile.gasLevel} 档</Tag>
               <Tag>载量 {currentProfile.chargeG}g</Tag>
@@ -939,6 +1124,21 @@ export default function CurveEntry() {
           </Button>
         </Form>
       </Modal>
+
+      {conflict ? (
+        <RoastConflictModal
+          open
+          mine={conflict.mine}
+          remote={conflict.remote}
+          beanName={(greenBeanId) => {
+            const bean = beanMap.get(greenBeanId);
+            return bean ? `${bean.origin} · ${bean.farm}` : '（生豆已删除）';
+          }}
+          resolving={resolving}
+          onCancel={() => void handleCancelConflict()}
+          onResolve={(merged) => void handleResolveConflict(merged)}
+        />
+      ) : null}
     </Space>
   );
 }
