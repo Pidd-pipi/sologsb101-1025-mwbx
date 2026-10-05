@@ -1,0 +1,150 @@
+/* 咖啡烘焙曲线与杯测档案 · 全局样式
+   暖棕纸底 + 焦糖主色，突出曲线与杯测表格的可读性。 */
+
+:root {
+  --gb-bg: #f7f1e8;
+  --gb-panel: #fffaf4;
+  --gb-ink: #3a2413;
+  --gb-caramel: #a8632c;
+  --gb-brown: #7a5230;
+  --gb-green: #2f6f4f;
+  --gb-red: #b3372f;
+  --gb-line: rgba(122, 82, 48, 0.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--gb-bg);
+  color: var(--gb-ink);
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 烘焙室质感底纹 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.55;
+  background-image:
+    radial-gradient(circle at 10% 12%, rgba(168, 99, 44, 0.1), transparent 42%),
+    radial-gradient(circle at 90% 6%, rgba(122, 82, 48, 0.1), transparent 38%),
+    repeating-linear-gradient(0deg, rgba(58, 36, 19, 0.016) 0 1px, transparent 1px 5px);
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* 通用面板 */
+.gb-panel {
+  background: var(--gb-panel);
+  border: 1px solid var(--gb-line);
+  border-radius: 10px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgba(58, 36, 19, 0.05);
+}
+
+.gb-panel + .gb-panel {
+  margin-top: 16px;
+}
+
+/* 统计徽标行 */
+.gb-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+/* 曲线时间轴 */
+.gb-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gb-timeline-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--gb-panel);
+  border: 1px solid var(--gb-line);
+  border-radius: 8px;
+  transition: box-shadow 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+}
+
+.gb-timeline-row:hover {
+  border-color: rgba(168, 99, 44, 0.45);
+  box-shadow: 0 3px 10px rgba(58, 36, 19, 0.08);
+}
+
+.gb-timeline-row.is-dragging {
+  opacity: 0.45;
+}
+
+.gb-timeline-row.is-drop-target {
+  border-color: var(--gb-caramel);
+  border-style: dashed;
+  transform: translateY(-2px);
+}
+
+.gb-drag-handle {
+  cursor: grab;
+  color: rgba(122, 82, 48, 0.65);
+  padding: 0 4px;
+  user-select: none;
+}
+
+.gb-drag-handle:active {
+  cursor: grabbing;
+}
+
+.gb-timeline-index {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(168, 99, 44, 0.14);
+  color: var(--gb-caramel);
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 表格紧凑一些，方便一屏看完整条曲线 */
+.gb-table .ant-table-cell {
+  vertical-align: middle;
+}
+
+.gb-mono {
+  font-family: 'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
+}
+
+.gb-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--gb-ink);
+}
+
+.gb-muted {
+  color: rgba(74, 44, 23, 0.6);
+  font-size: 12px;
+}
